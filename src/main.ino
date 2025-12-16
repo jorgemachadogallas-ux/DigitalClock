@@ -2,45 +2,84 @@
 #include "time.h"
 #include <TM1637Display.h>
 #include <Arduino.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>   // ArduinoJson v6
 
-const char *ssid = "SSID";
-const char *ssid_password = "PASSWORD";
+// ------------------------
+// WiFi
+// ------------------------
+const char *ssid          = "SSID";
+const char *ssid_password = "123456789";
 
-// Servidor NTP
+// ------------------------
+// NTP
+// ------------------------
 const char* ntpServer = "pool.ntp.org";
 
-// Temporizador para actualizar display y parpadeo
-unsigned long lastTimeUpdate = 0;
-const unsigned long timeUpdateInterval = 1000; // 1 segundo
-
-// Pines TM1637 (ajusta a tu ESP32-C3 mini; 3 y 4 son RTC/JTAG pero usables si no usas JTAG)
+// ------------------------
+// TM1637 (ajusta a tu ESP32-C3 mini)
+// ------------------------
 #define CLK 3
 #define DIO 4
-
 TM1637Display display(CLK, DIO);
 
+// ------------------------
+// Temporizadores
+// ------------------------
+unsigned long lastTimeUpdate       = 0;
+const unsigned long timeUpdateInterval = 1000; // 1 s
+
+// ------------------------
 // Estado del “:”
+// ------------------------
 bool colonState = false;
 
-// Brillo actual (para no llamar setBrightness si no cambia)
-byte currentBrightness = 1;
+// ------------------------
+// Brillo
+// ------------------------
+byte currentBrightness = 1;  // brillo actual del display
 
-// Control de resincro NTP diaria
+// Config remota de brillo (por defecto)
+int  dayStartHour      = 8;
+int  nightStartHour    = 20;
+byte dayBrightness     = 3;  // 0–7
+byte nightBrightness   = 1;  // 0–7
+
+// URL JSON remoto (S3 con HTTPS)
+const char* configUrl =
+  "https://jmg-s3-bucket.s3.us-east-1.amazonaws.com/brightness_config.json";
+
+// Temporizador para refrescar config remota
+unsigned long lastConfigFetch = 0;
+const unsigned long configFetchInterval = 5UL * 60UL * 1000UL; // cada 5 minutos
+
+// Cliente seguro para HTTPS
+WiFiClientSecure secureClient;
+
+// ------------------------
+// Resincro NTP diaria
+// ------------------------
 bool resyncDoneToday = false;
-int lastResyncDay = -1;
+int  lastResyncDay   = -1;
 
+// ----------------------------------------------------
+// Conexión WiFi
+// ----------------------------------------------------
 void connectWifi() {
   Serial.println();
   Serial.println("******************************************************");
   Serial.print("Conectando a WiFi SSID: ");
   Serial.println(ssid);
   WiFi.begin(ssid, ssid_password);
+
   int maxWait = 20000;
   unsigned long startTime = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < maxWait) {
     delay(500);
     Serial.print(".");
   }
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println();
     Serial.print("✓ WiFi conectada. IP: ");
@@ -55,18 +94,18 @@ void connectWifi() {
   }
 }
 
-// Inicializar tiempo con NTP y zona horaria España (CET/CEST con DST automático)
+// ----------------------------------------------------
+// Inicializar tiempo con NTP (zona horaria España)
+// ----------------------------------------------------
 void initTime() {
-  // Sin offset aquí, solo NTP
   configTime(0, 0, ntpServer);
 
   Serial.println("Sincronizando reloj con NTP...");
   struct tm timeinfo;
 
-  const int maxRetries = 10;          // 10 intentos
+  const int maxRetries = 10;
   int retries = 0;
 
-  // Espera a que haya primera sincronización (máx ~10 s)
   while (!getLocalTime(&timeinfo) && retries < maxRetries) {
     Serial.print(".");
     retries++;
@@ -76,20 +115,19 @@ void initTime() {
 
   if (!getLocalTime(&timeinfo)) {
     Serial.println("ERROR: No se pudo obtener hora NTP tras varios intentos. Reiniciando ESP32...");
-    delay(2000);          // pequeño margen para ver el mensaje
-    ESP.restart();        // reinicio por software [web:200][web:204]
-    return;               // por claridad, aunque tras restart no sigue
+    delay(2000);
+    ESP.restart();
+    return;
   }
 
-  // Zona horaria Europa/Madrid (CET/CEST con DST automático)
+  // Zona horaria Europa/Madrid (CET/CEST)
   setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
   tzset();
 
-  // Actualizar de nuevo tras aplicar TZ
   if (getLocalTime(&timeinfo)) {
     Serial.printf("Hora local inicial: %02d/%02d/%04d %02d:%02d:%02d\n",
-      timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
-      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                  timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     Serial.println("Zona horaria: CET/CEST con cambio automático verano/invierno");
   } else {
     Serial.println("Error al obtener hora local tras aplicar TZ. Reiniciando ESP32...");
@@ -98,24 +136,99 @@ void initTime() {
   }
 }
 
+// ----------------------------------------------------
+// Lectura de configuración remota de brillo (HTTPS)
+// ----------------------------------------------------
+void fetchBrightnessConfig() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No WiFi, no se actualiza config de brillo.");
+    return;
+  }
 
-// Ajuste de brillo automático, evitando llamadas redundantes
+  // Aceptar cualquier certificado (simplificación, menos seguro)
+  secureClient.setInsecure();  // Para producción, usar setCACert con la CA de AWS S3[web:42][web:65]
+
+  HTTPClient https;
+  Serial.printf("Obteniendo config brillo desde: %s\n", configUrl);
+  if (!https.begin(secureClient, configUrl)) {
+    Serial.println("Fallo en begin() HTTPS.");
+    return;
+  }
+
+  int httpCode = https.GET();  // GET HTTPS[web:42][web:77]
+
+  if (httpCode > 0) {
+    Serial.printf("HTTPS GET config, código: %d\n", httpCode);
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = https.getString();
+      Serial.println("Respuesta config:");
+      Serial.println(payload);
+
+      StaticJsonDocument<256> doc;  // tamaño suficiente para 4 campos simples[web:66][web:69]
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        if (doc.containsKey("dayStartHour"))
+          dayStartHour = doc["dayStartHour"];
+        if (doc.containsKey("nightStartHour"))
+          nightStartHour = doc["nightStartHour"];
+        if (doc.containsKey("dayBrightness"))
+          dayBrightness = doc["dayBrightness"];
+        if (doc.containsKey("nightBrightness"))
+          nightBrightness = doc["nightBrightness"];
+
+        // Normalizar rangos
+        if (dayStartHour < 0) dayStartHour = 0;
+        if (dayStartHour > 23) dayStartHour = 23;
+        if (nightStartHour < 0) nightStartHour = 0;
+        if (nightStartHour > 23) nightStartHour = 23;
+
+        if (dayBrightness > 7) dayBrightness = 7;
+        if (nightBrightness > 7) nightBrightness = 7;
+
+        Serial.printf("Config brillo actualizada: dayStartHour=%d, nightStartHour=%d, dayBrightness=%d, nightBrightness=%d\n",
+                      dayStartHour, nightStartHour, dayBrightness, nightBrightness);
+      } else {
+        Serial.print("Error parseando JSON: ");
+        Serial.println(error.c_str());
+      }
+    } else {
+      Serial.printf("Respuesta HTTP no OK: %d\n", httpCode);
+    }
+  } else {
+    Serial.printf("Error HTTPS GET config: %s\n", https.errorToString(httpCode).c_str());
+  }
+
+  https.end();
+}
+
+// ----------------------------------------------------
+// Brillo automático usando config remota
+// ----------------------------------------------------
 void setAutoBrightness(int hora) {
-  byte newBrightness = (hora >= 8 && hora <= 20) ? 7 : 1;  // día / noche [web:62][web:71]
+  byte newBrightness;
+
+  // Día entre dayStartHour y nightStartHour (sin cruzar medianoche)
+  if (hora >= dayStartHour && hora < nightStartHour) {
+    newBrightness = dayBrightness;
+  } else {
+    newBrightness = nightBrightness;
+  }
+
   if (newBrightness != currentBrightness) {
     currentBrightness = newBrightness;
-    display.setBrightness(currentBrightness);
+    display.setBrightness(currentBrightness);  // rango 0–7[web:10][web:32]
   }
 }
 
-// Resincro NTP una vez al día a las 03:00:00
+// ----------------------------------------------------
+// Resincro NTP diaria a las 03:00:00
+// ----------------------------------------------------
 void handleDailyResync(struct tm &timeinfo) {
   int day = timeinfo.tm_mday;
 
-  // Si ha cambiado de día, resetea flag
   if (day != lastResyncDay) {
     resyncDoneToday = false;
-    lastResyncDay = day;
+    lastResyncDay   = day;
   }
 
   if (!resyncDoneToday &&
@@ -128,7 +241,9 @@ void handleDailyResync(struct tm &timeinfo) {
   }
 }
 
-// Función que imprime en Serial y muestra en el display HH:MM
+// ----------------------------------------------------
+// Mostrar hora en display HH:MM
+// ----------------------------------------------------
 void printAndShowTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
@@ -136,59 +251,70 @@ void printAndShowTime() {
     return;
   }
 
-  // Log en Serial
   Serial.printf("%02d/%02d/%04d %02d:%02d:%02d (local)\n",
-    timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
-    timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
 
   int hora   = timeinfo.tm_hour;
   int minuto = timeinfo.tm_min;
   int valorDisplay = hora * 100 + minuto; // HHMM
 
-  // Brillo automático día/noche
+  // Brillo según config remota
   setAutoBrightness(hora);
 
-  // Resincro NTP controlada
+  // Resincro diaria
   handleDailyResync(timeinfo);
 
-  // Máscara del “:”
   uint8_t dotsMask = colonState ? 0b01000000 : 0b00000000;
-
-  // Mostrar HH:MM con o sin “:” (4 dígitos, desde la posición 0)
-  display.showNumberDecEx(valorDisplay, dotsMask, true, 4, 0); // [web:56][web:62]
+  display.showNumberDecEx(valorDisplay, dotsMask, true, 4, 0);  // HH:MM[web:10]
 }
 
+// ----------------------------------------------------
+// setup()
+// ----------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  Serial.println("https://github.com/jorgemachadogallas-ux/DigitalClock");
 
   display.setBrightness(currentBrightness);
-  display.showNumberDec(0, true);  // 0000 al inicio
+  display.showNumberDec(0, true);  // 0000 al inicio[web:10]
 
   connectWifi();
 
   if (WiFi.status() == WL_CONNECTED) {
-    initTime();          // NTP + zona horaria con DST automático [web:124]
-    printAndShowTime();  // primera actualización
-    Serial.println("Reloj listo: HH:MM en TM1637 con ':' parpadeando y DST automático");
+    initTime();
+    fetchBrightnessConfig();  // primera lectura de config remota
+    printAndShowTime();
+    Serial.println("Reloj listo: HH:MM en TM1637 con ':' parpadeando, DST y brillo remoto.");
   } else {
     Serial.println("Sin WiFi: el reloj usará solo el RTC interno hasta que se recupere la conexión.");
   }
 }
 
+// ----------------------------------------------------
+// loop()
+// ----------------------------------------------------
 void loop() {
   // Reintentar WiFi si se pierde
   if (WiFi.status() != WL_CONNECTED) {
     connectWifi();
     if (WiFi.status() == WL_CONNECTED) {
-      initTime();  // resincronizar al recuperar WiFi [web:182]
+      initTime();
+      fetchBrightnessConfig();  // actualizar config al recuperar conexión
     }
   }
 
-  // Cada 1 segundo: cambiar estado del “:” y actualizar hora
+  // Refrescar config remota periódicamente
+  if (millis() - lastConfigFetch >= configFetchInterval) {
+    fetchBrightnessConfig();
+    lastConfigFetch = millis();
+  }
+
+  // Cada 1 s: parpadeo ":" y actualización de hora
   if (millis() - lastTimeUpdate >= timeUpdateInterval) {
-    colonState = !colonState;      // alternar ON/OFF del “:”
-    printAndShowTime();            // refrescar Serial + display
+    colonState = !colonState;
+    printAndShowTime();
     lastTimeUpdate = millis();
   }
 
